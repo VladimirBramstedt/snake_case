@@ -137,6 +137,13 @@ impl std::borrow::Borrow<str> for SnakeCase {
     }
 }
 
+impl std::ops::Deref for SnakeCase {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl fmt::Debug for SnakeCase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(f)
@@ -257,6 +264,13 @@ impl std::borrow::Borrow<str> for SnakeCaseRef<'_> {
     }
 }
 
+impl std::ops::Deref for SnakeCaseRef<'_> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
 impl fmt::Debug for SnakeCaseRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(f)
@@ -357,6 +371,10 @@ mod tests {
         assert_eq!(scr, "hello_world");
         let sc2: SnakeCase = scr.to_owned();
         assert_eq!(sc2, "hello_world");
+        // Deref<Target = str>
+        let s: &str = &sc;
+        assert_eq!(s, "hello_world");
+        assert!(sc.starts_with("hello") && scr.ends_with("world"));
 
         use std::collections::HashSet;
         let mut set: HashSet<SnakeCase> = HashSet::new();
