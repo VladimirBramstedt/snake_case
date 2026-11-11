@@ -119,6 +119,44 @@ pub const fn is_snake_case(s: &str) -> bool {
 }
 }
 
+// overlapping chunks; start check folded into the result instead of an early return
+mod pairs {
+const fn valid_start(b: u8) -> bool { b == b'_' || b'a' <= b && b <= b'z' }
+const fn ok(c: u8) -> bool { (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_') }
+const fn chunk_ok<const N: usize>(chunk: &[u8; N]) -> bool {
+    let mut all_valid = true; let mut i = 0;
+    while i < N { all_valid &= ok(chunk[i]); i += 1; }
+    all_valid
+}
+pub const fn is_snake_case(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // the chunks check every byte with ok(); the only extra rule for the first byte is "not a digit".
+    let start = match bytes { [first, ..] => *first > b'9', [] => return false };
+    if let Some(last) = bytes.last_chunk::<16>() {
+        let mut rest = bytes;
+        while let Some((chunk, tail)) = rest.split_first_chunk::<16>() {
+            if !chunk_ok(chunk) { return false; }
+            rest = tail;
+        }
+        return chunk_ok(last) & start;
+    }
+    if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        let mut both = [0u8; 16]; let mut i = 0;
+        while i < 8 { both[i] = first[i]; both[i + 8] = last[i]; i += 1; }
+        return chunk_ok(&both) & start;
+    }
+    if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        let mut both = [0u8; 8]; let mut i = 0;
+        while i < 4 { both[i] = first[i]; both[i + 4] = last[i]; i += 1; }
+        return chunk_ok(&both) & start;
+    }
+    let mut rest = bytes;
+    let mut all_valid = start;
+    while let [c, tail @ ..] = rest { all_valid &= ok(*c); rest = tail; }
+    all_valid
+}
+}
+
 fn t(f: fn(&str) -> bool, s: &str, it: usize) -> f64 {
     let mut best = f64::MAX;
     for _ in 0..7 {
@@ -130,8 +168,8 @@ fn t(f: fn(&str) -> bool, s: &str, it: usize) -> f64 {
 }
 
 fn main() {
-    let fs: [(&str, fn(&str) -> bool); 3] =
-        [("master", master::is_snake_case), ("current", current::is_snake_case), ("overlap", overlap::is_snake_case)];
+    let fs: [(&str, fn(&str) -> bool); 4] =
+        [("master", master::is_snake_case), ("current", current::is_snake_case), ("overlap", overlap::is_snake_case), ("pairs", pairs::is_snake_case)];
     // correctness: valid strings, and a bad byte at every position
     for n in 1..80 {
         let s: String = "abc_def_0123456789_".chars().cycle().take(n).collect();
@@ -146,11 +184,33 @@ fn main() {
         }
     }
     println!("all variants agree on correctness\n");
-    println!("  len   master  current  overlap   cur_x  over_x");
+    println!("  len   master  current  overlap    pairs   cur_x  over_x  pair_x");
     for n in [2usize, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32, 64, 256, 4096] {
         let s: String = "abc_def_0123456789_".chars().cycle().take(n).collect();
         let it = 20_000_000 / n.max(16);
-        let (m, c, o) = (t(fs[0].1, &s, it), t(fs[1].1, &s, it), t(fs[2].1, &s, it));
-        println!("{n:5} {m:8.2} {c:8.2} {o:8.2} {:6.1}x {:6.1}x", m / c, m / o);
+        let r: Vec<f64> = fs.iter().map(|(_, f)| t(*f, &s, it)).collect();
+        println!("{n:5} {:8.2} {:8.2} {:8.2} {:8.2} {:6.1}x {:6.1}x {:6.1}x", r[0], r[1], r[2], r[3], r[0] / r[1], r[0] / r[2], r[0] / r[3]);
+    }
+    // mixed lengths: random identifiers, so branch prediction can't learn one length
+    println!("\nmixed lengths, ns per call   master  current  overlap    pairs   cur_x  over_x  pair_x");
+    for (lo, hi) in [(2usize, 24usize), (2, 64)] {
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz_0123456789";
+        let ids: Vec<String> = (0..4096).map(|_| {
+            let n = lo + (rnd() as usize) % (hi - lo + 1);
+            (0..n).map(|k| alphabet[(rnd() as usize) % if k == 0 { 27 } else { alphabet.len() }] as char).collect()
+        }).collect();
+        let r: Vec<f64> = fs.iter().map(|(name, f)| {
+            assert!(ids.iter().all(|s| f(s)), "{name} rejected a mixed id");
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = Instant::now();
+                for _ in 0..500 { for s in &ids { black_box(f(black_box(s))); } }
+                best = best.min(t.elapsed().as_nanos() as f64 / (500 * ids.len()) as f64);
+            }
+            best
+        }).collect();
+        println!("  len {lo:2}..={hi:2}                {:8.2} {:8.2} {:8.2} {:8.2} {:6.1}x {:6.1}x {:6.1}x", r[0], r[1], r[2], r[3], r[0] / r[1], r[0] / r[2], r[0] / r[3]);
     }
 }
