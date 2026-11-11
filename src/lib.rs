@@ -12,27 +12,63 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const fn is_snake_case(string: &str) -> bool {
     // we only care about ascii chars, which fit in a byte.
     // iterating over utf8 continuation bytes and the like will not count as valid snake case anyway.
-    let (len, bytes) = (string.len(), string.as_bytes());
-    const fn valid_start(b: u8) -> bool {
-        b == b'_' || b'a' <= b && b <= b'z'
-    }
+    //
+    // Performance notes:
+    // * bytes are checked in fixed-size chunks with no early exit inside a chunk,
+    //   so LLVM turns each chunk check into a few SIMD instructions.
+    // * lengths that don't fit the chunks exactly are covered by overlapping chunks,
+    //   so there is no byte-by-byte tail loop for anything over 3 bytes.
+    // * slice patterns and `[u8; N]` chunks instead of slice indexing: no bounds checks, no panics.
     const fn is_snake_case_character(c: u8) -> bool {
-        b'a' <= c && c <= b'z' || b'0' <= c && c <= b'9' || c == b'_'
+        // branchless on purpose, see above.
+        (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_')
     }
-    // non-empty and starts with a..z or _
-    if bytes.is_empty() || !valid_start(bytes[0]) {
-        return false;
+    const fn all_snake_case_characters<const N: usize>(chunk: &[u8; N]) -> bool {
+        let mut all_valid = true;
+        let mut i = 0;
+        while i < N {
+            all_valid &= is_snake_case_character(chunk[i]);
+            i += 1;
+        }
+        all_valid
     }
-    //check the rest
-    let mut i = 1; // we already checked the first byte, its fine
-    loop {
-        if i >= len - 1 {
-            break true;
+
+    let bytes = string.as_bytes();
+    // Every byte gets checked with is_snake_case_character() below, so the only extra rule for the
+    // first byte is "not a digit". It's checked in each branch, combined with the result: checking it
+    // once up front, or returning early on it, lets LLVM reuse that early load of byte 0 and build
+    // the SIMD chunks out of small pieces instead of loading them whole.
+    if let Some(last) = bytes.last_chunk::<16>() {
+        // 16+ bytes: 16-byte chunks, then the last 16 bytes for whatever is left over.
+        let valid_start = !bytes[0].is_ascii_digit();
+        let mut rest = bytes;
+        while let Some((chunk, tail)) = rest.split_first_chunk::<16>() {
+            if !all_snake_case_characters(chunk) {
+                return false;
+            }
+            rest = tail;
         }
-        if !is_snake_case_character(bytes[i]) {
-            break false;
+        valid_start & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        // 8..=15 bytes: the first 8 and the last 8, which may overlap.
+        !first[0].is_ascii_digit()
+            & all_snake_case_characters(first)
+            & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        // 4..=7 bytes: the first 4 and the last 4, which may overlap.
+        !first[0].is_ascii_digit()
+            & all_snake_case_characters(first)
+            & all_snake_case_characters(last)
+    } else {
+        // 1..=3 bytes: one at a time.
+        let [first, ..] = bytes else { return false };
+        let mut all_valid = !first.is_ascii_digit();
+        let mut rest = bytes;
+        while let [c, tail @ ..] = rest {
+            all_valid &= is_snake_case_character(*c);
+            rest = tail;
         }
-        i += 1;
+        all_valid
     }
 }
 
@@ -74,7 +110,7 @@ impl SnakeCase {
         &self.0
     }
 
-    pub fn as_ref(&self) -> SnakeCaseRef {
+    pub fn as_ref(&self) -> SnakeCaseRef<'_> {
         SnakeCaseRef(&self.0)
     }
 }
@@ -162,7 +198,7 @@ impl std::cmp::PartialEq<String> for SnakeCase {
 pub struct SnakeCaseRef<'a>(&'a str);
 
 impl<'a> SnakeCaseRef<'a> {
-    pub const fn try_from_str(s: &str) -> Result<SnakeCaseRef, InvalidSnakeCase> {
+    pub const fn try_from_str(s: &str) -> Result<SnakeCaseRef<'_>, InvalidSnakeCase> {
         if is_snake_case(s) {
             Ok(SnakeCaseRef(s))
         } else {
@@ -180,8 +216,11 @@ impl<'a> SnakeCaseRef<'a> {
 }
 
 #[cfg(feature = "const_literals")]
-/// an unsafe constructor for SnakeCaseRef. caller has to make sure the input is in fact valid.
-pub const unsafe fn from_str_unchecked(s: &str) -> SnakeCaseRef {
+/// an unsafe constructor for SnakeCaseRef.
+///
+/// # Safety
+/// The caller has to make sure the input is in fact valid snake_case (see [`is_snake_case`]).
+pub const unsafe fn from_str_unchecked(s: &str) -> SnakeCaseRef<'_> {
     SnakeCaseRef(s)
 }
 #[cfg(feature = "const_literals")]
@@ -214,7 +253,7 @@ impl<'a> TryFrom<&'a str> for SnakeCaseRef<'a> {
 
 impl std::borrow::Borrow<str> for SnakeCaseRef<'_> {
     fn borrow(&self) -> &str {
-        &self.0
+        self.0
     }
 }
 
@@ -277,6 +316,25 @@ mod tests {
         assert!(SnakeCase::try_from_str("").is_err());
         assert!(SnakeCase::try_from_str("42").is_err());
         assert!(SnakeCase::try_from_str("_").is_ok());
+        assert!(SnakeCase::try_from_str("aB").is_err());
+        assert!(SnakeCase::try_from_str("foo!").is_err());
+    }
+
+    #[test]
+    fn is_snake_case_every_length_and_position() {
+        // covers each chunk size and every way the overlapping chunks line up.
+        for len in 1..80 {
+            let valid: String = "abc_def_0123456789_".chars().cycle().take(len).collect();
+            assert!(is_snake_case(&valid), "{:?}", valid);
+            for pos in 0..len {
+                let mut invalid = valid.clone().into_bytes();
+                invalid[pos] = b'X';
+                let invalid = String::from_utf8(invalid).unwrap();
+                assert!(!is_snake_case(&invalid), "{:?}", invalid);
+            }
+            let leading_digit = format!("1{}", &valid[1..]);
+            assert!(!is_snake_case(&leading_digit), "{:?}", leading_digit);
+        }
     }
 
     #[test]
