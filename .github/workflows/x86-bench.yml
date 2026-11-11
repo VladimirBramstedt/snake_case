@@ -1,0 +1,18 @@
+name: x86 bench
+on:
+  push:
+    branches: [x86-bench]
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: machine
+        run: rustc --version && lscpu | grep -E 'Model name|^CPU\(s\)'
+      - name: baseline x86_64 (SSE2), run 1
+        run: rustc -O --edition 2024 -A warnings bench/x86_bench.rs -o xb && ./xb
+      - name: baseline x86_64 (SSE2), run 2
+        run: ./xb
+      - name: target-cpu=native (AVX2 etc.)
+        run: rustc -O -C target-cpu=native --edition 2024 -A warnings bench/x86_bench.rs -o xbn && ./xbn
