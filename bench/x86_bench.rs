@@ -31,59 +31,77 @@ pub const fn is_snake_case(string: &str) -> bool {
 }
 }
 
-// simd-check-and-deref (current)
+// simd-check-and-deref (final, readable)
 mod current {
 pub const fn is_snake_case(string: &str) -> bool {
     // we only care about ascii chars, which fit in a byte.
     // iterating over utf8 continuation bytes and the like will not count as valid snake case anyway.
-    // slice patterns and fixed-size chunks instead of slice indexing: no bounds checks, no panic paths.
-    const fn valid_start(b: u8) -> bool {
-        b == b'_' || b'a' <= b && b <= b'z'
-    }
-    // branchless, so the chunk loop below auto-vectorizes.
-    const fn ok(c: u8) -> bool {
+    //
+    // Performance notes:
+    // * bytes are checked in fixed-size chunks with no early exit inside a chunk,
+    //   so LLVM turns each chunk check into a few SIMD instructions.
+    // * lengths that don't fit the chunks exactly are covered by overlapping chunks,
+    //   so there is no byte-by-byte tail loop for anything over 3 bytes.
+    // * slice patterns and `[u8; N]` chunks instead of slice indexing: no bounds checks, no panics.
+    const fn is_snake_case_character(c: u8) -> bool {
+        // branchless on purpose, see above.
         (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_')
     }
-    // non-empty and starts with a..z or _
-    let mut rest = string.as_bytes();
-    match rest {
-        [first, ..] if valid_start(*first) => {}
-        _ => return false,
-    }
-    // the first byte gets checked again below; cheaper than misaligning the chunks.
-    // 16 bytes at a time, without short-circuiting inside a chunk, so LLVM emits SIMD.
-    while let Some((chunk, tail)) = rest.split_first_chunk::<16>() {
+    const fn all_snake_case_characters<const N: usize>(chunk: &[u8; N]) -> bool {
         let mut all_valid = true;
         let mut i = 0;
-        while i < 16 {
-            all_valid &= ok(chunk[i]);
+        while i < N {
+            all_valid &= is_snake_case_character(chunk[i]);
             i += 1;
         }
-        if !all_valid {
-            return false;
-        }
-        rest = tail;
+        all_valid
     }
-    // one 8-byte chunk, so typical identifier lengths take the SIMD path too.
-    if let Some((chunk, tail)) = rest.split_first_chunk::<8>() {
+    // One loop over both chunks, so LLVM checks them as a single SIMD chunk
+    // (two separate checks compile to much worse code on x86).
+    const fn both_snake_case_characters<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
         let mut all_valid = true;
         let mut i = 0;
-        while i < 8 {
-            all_valid &= ok(chunk[i]);
+        while i < N {
+            all_valid &= is_snake_case_character(a[i]) & is_snake_case_character(b[i]);
             i += 1;
         }
-        if !all_valid {
-            return false;
-        }
-        rest = tail;
+        all_valid
     }
-    while let [c, tail @ ..] = rest {
-        if !ok(*c) {
-            return false;
+
+    let bytes = string.as_bytes();
+    // Every byte gets checked with is_snake_case_character() below, so the only extra rule for the
+    // first byte is "not a digit". It's combined with the result rather than returned early,
+    // which would let LLVM drop byte 0 from the SIMD check and split up the loads.
+    let valid_start = match bytes {
+        [first, ..] => !first.is_ascii_digit(),
+        [] => return false,
+    };
+    if let Some(last) = bytes.last_chunk::<16>() {
+        // 16+ bytes: 16-byte chunks, then the last 16 bytes for whatever is left over.
+        let mut rest = bytes;
+        while let Some((chunk, tail)) = rest.split_first_chunk::<16>() {
+            if !all_snake_case_characters(chunk) {
+                return false;
+            }
+            rest = tail;
         }
-        rest = tail;
+        valid_start & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        // 8..=15 bytes: the first 8 and the last 8, which may overlap.
+        valid_start & both_snake_case_characters(first, last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        // 4..=7 bytes: the first 4 and the last 4, which may overlap.
+        valid_start & both_snake_case_characters(first, last)
+    } else {
+        // 1..=3 bytes: one at a time.
+        let mut all_valid = true;
+        let mut rest = bytes;
+        while let [c, tail @ ..] = rest {
+            all_valid &= is_snake_case_character(*c);
+            rest = tail;
+        }
+        valid_start & all_valid
     }
-    true
 }
 }
 
