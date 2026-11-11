@@ -105,73 +105,124 @@ pub const fn is_snake_case(string: &str) -> bool {
 }
 }
 
-// overlapping-chunks variant
-mod overlap {
-const fn valid_start(b: u8) -> bool { b == b'_' || b'a' <= b && b <= b'z' }
-const fn ok(c: u8) -> bool { (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_') }
-const fn chunk_ok<const N: usize>(chunk: &[u8; N]) -> bool {
-    let mut all_valid = true; let mut i = 0;
-    while i < N { all_valid &= ok(chunk[i]); i += 1; }
-    all_valid
-}
-pub const fn is_snake_case(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    match bytes { [first, ..] if valid_start(*first) => {}, _ => return false }
+// v2: start check at the end of each branch
+mod v2 {
+pub const fn is_snake_case(string: &str) -> bool {
+    // we only care about ascii chars, which fit in a byte.
+    // iterating over utf8 continuation bytes and the like will not count as valid snake case anyway.
+    //
+    // Performance notes:
+    // * bytes are checked in fixed-size chunks with no early exit inside a chunk,
+    //   so LLVM turns each chunk check into a few SIMD instructions.
+    // * lengths that don't fit the chunks exactly are covered by overlapping chunks,
+    //   so there is no byte-by-byte tail loop for anything over 3 bytes.
+    // * slice patterns and `[u8; N]` chunks instead of slice indexing: no bounds checks, no panics.
+    const fn is_snake_case_character(c: u8) -> bool {
+        // branchless on purpose, see above.
+        (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_')
+    }
+    const fn all_snake_case_characters<const N: usize>(chunk: &[u8; N]) -> bool {
+        let mut all_valid = true;
+        let mut i = 0;
+        while i < N {
+            all_valid &= is_snake_case_character(chunk[i]);
+            i += 1;
+        }
+        all_valid
+    }
+
+    let bytes = string.as_bytes();
+    // Every byte gets checked with is_snake_case_character() below, so the only extra rule for the
+    // first byte is "not a digit". It's combined with the result rather than returned early,
+    // which would let LLVM drop byte 0 from the SIMD check and split up the loads.
     if let Some(last) = bytes.last_chunk::<16>() {
+        // 16+ bytes: 16-byte chunks, then the last 16 bytes for whatever is left over.
         let mut rest = bytes;
         while let Some((chunk, tail)) = rest.split_first_chunk::<16>() {
-            if !chunk_ok(chunk) { return false; }
+            if !all_snake_case_characters(chunk) {
+                return false;
+            }
             rest = tail;
         }
-        return chunk_ok(last);
+        !bytes[0].is_ascii_digit() & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        // 8..=15 bytes: the first 8 and the last 8, which may overlap.
+        !first[0].is_ascii_digit() & all_snake_case_characters(first) & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        // 4..=7 bytes: the first 4 and the last 4, which may overlap.
+        !first[0].is_ascii_digit() & all_snake_case_characters(first) & all_snake_case_characters(last)
+    } else {
+        // 1..=3 bytes: one at a time.
+        let [first, ..] = bytes else { return false };
+        let mut all_valid = !first.is_ascii_digit();
+        let mut rest = bytes;
+        while let [c, tail @ ..] = rest {
+            all_valid &= is_snake_case_character(*c);
+            rest = tail;
+        }
+        all_valid
     }
-    if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
-        return chunk_ok(first) & chunk_ok(last);
-    }
-    if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
-        return chunk_ok(first) & chunk_ok(last);
-    }
-    let mut rest = bytes;
-    while let [c, tail @ ..] = rest { if !ok(*c) { return false; } rest = tail; }
-    true
 }
 }
 
-// overlapping chunks; start check folded into the result instead of an early return
-mod pairs {
-const fn valid_start(b: u8) -> bool { b == b'_' || b'a' <= b && b <= b'z' }
-const fn ok(c: u8) -> bool { (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_') }
-const fn chunk_ok<const N: usize>(chunk: &[u8; N]) -> bool {
-    let mut all_valid = true; let mut i = 0;
-    while i < N { all_valid &= ok(chunk[i]); i += 1; }
-    all_valid
-}
-pub const fn is_snake_case(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    // the chunks check every byte with ok(); the only extra rule for the first byte is "not a digit".
-    let start = match bytes { [first, ..] => *first > b'9', [] => return false };
+// v3: like v2, start check at the top of the 16+ branch
+mod v3 {
+pub const fn is_snake_case(string: &str) -> bool {
+    // we only care about ascii chars, which fit in a byte.
+    // iterating over utf8 continuation bytes and the like will not count as valid snake case anyway.
+    //
+    // Performance notes:
+    // * bytes are checked in fixed-size chunks with no early exit inside a chunk,
+    //   so LLVM turns each chunk check into a few SIMD instructions.
+    // * lengths that don't fit the chunks exactly are covered by overlapping chunks,
+    //   so there is no byte-by-byte tail loop for anything over 3 bytes.
+    // * slice patterns and `[u8; N]` chunks instead of slice indexing: no bounds checks, no panics.
+    const fn is_snake_case_character(c: u8) -> bool {
+        // branchless on purpose, see above.
+        (c.wrapping_sub(b'a') < 26) | (c.wrapping_sub(b'0') < 10) | (c == b'_')
+    }
+    const fn all_snake_case_characters<const N: usize>(chunk: &[u8; N]) -> bool {
+        let mut all_valid = true;
+        let mut i = 0;
+        while i < N {
+            all_valid &= is_snake_case_character(chunk[i]);
+            i += 1;
+        }
+        all_valid
+    }
+
+    let bytes = string.as_bytes();
+    // Every byte gets checked with is_snake_case_character() below, so the only extra rule for the
+    // first byte is "not a digit". It's combined with the result rather than returned early,
+    // which would let LLVM drop byte 0 from the SIMD check and split up the loads.
     if let Some(last) = bytes.last_chunk::<16>() {
+        // 16+ bytes: 16-byte chunks, then the last 16 bytes for whatever is left over.
+        let valid_start = !bytes[0].is_ascii_digit();
         let mut rest = bytes;
         while let Some((chunk, tail)) = rest.split_first_chunk::<16>() {
-            if !chunk_ok(chunk) { return false; }
+            if !all_snake_case_characters(chunk) {
+                return false;
+            }
             rest = tail;
         }
-        return chunk_ok(last) & start;
+        valid_start & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
+        // 8..=15 bytes: the first 8 and the last 8, which may overlap.
+        !first[0].is_ascii_digit() & all_snake_case_characters(first) & all_snake_case_characters(last)
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        // 4..=7 bytes: the first 4 and the last 4, which may overlap.
+        !first[0].is_ascii_digit() & all_snake_case_characters(first) & all_snake_case_characters(last)
+    } else {
+        // 1..=3 bytes: one at a time.
+        let [first, ..] = bytes else { return false };
+        let mut all_valid = !first.is_ascii_digit();
+        let mut rest = bytes;
+        while let [c, tail @ ..] = rest {
+            all_valid &= is_snake_case_character(*c);
+            rest = tail;
+        }
+        all_valid
     }
-    if let (Some(first), Some(last)) = (bytes.first_chunk::<8>(), bytes.last_chunk::<8>()) {
-        let mut both = [0u8; 16]; let mut i = 0;
-        while i < 8 { both[i] = first[i]; both[i + 8] = last[i]; i += 1; }
-        return chunk_ok(&both) & start;
-    }
-    if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
-        let mut both = [0u8; 8]; let mut i = 0;
-        while i < 4 { both[i] = first[i]; both[i + 4] = last[i]; i += 1; }
-        return chunk_ok(&both) & start;
-    }
-    let mut rest = bytes;
-    let mut all_valid = start;
-    while let [c, tail @ ..] = rest { all_valid &= ok(*c); rest = tail; }
-    all_valid
 }
 }
 
@@ -187,7 +238,7 @@ fn t(f: fn(&str) -> bool, s: &str, it: usize) -> f64 {
 
 fn main() {
     let fs: [(&str, fn(&str) -> bool); 4] =
-        [("master", master::is_snake_case), ("current", current::is_snake_case), ("overlap", overlap::is_snake_case), ("pairs", pairs::is_snake_case)];
+        [("master", master::is_snake_case), ("current", current::is_snake_case), ("v2", v2::is_snake_case), ("v3", v3::is_snake_case)];
     // correctness: valid strings, and a bad byte at every position
     for n in 1..80 {
         let s: String = "abc_def_0123456789_".chars().cycle().take(n).collect();
@@ -202,7 +253,7 @@ fn main() {
         }
     }
     println!("all variants agree on correctness\n");
-    println!("  len   master  current  overlap    pairs   cur_x  over_x  pair_x");
+    println!("  len   master  current       v2       v3   cur_x   v2_x    v3_x");
     for n in [2usize, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32, 64, 256, 4096] {
         let s: String = "abc_def_0123456789_".chars().cycle().take(n).collect();
         let it = 20_000_000 / n.max(16);
@@ -210,7 +261,7 @@ fn main() {
         println!("{n:5} {:8.2} {:8.2} {:8.2} {:8.2} {:6.1}x {:6.1}x {:6.1}x", r[0], r[1], r[2], r[3], r[0] / r[1], r[0] / r[2], r[0] / r[3]);
     }
     // mixed lengths: random identifiers, so branch prediction can't learn one length
-    println!("\nmixed lengths, ns per call   master  current  overlap    pairs   cur_x  over_x  pair_x");
+    println!("\nmixed lengths, ns per call   master  current       v2       v3   cur_x   v2_x    v3_x");
     for (lo, hi) in [(2usize, 24usize), (2, 64)] {
         let mut seed = 0x2545F4914F6CDD1Du64;
         let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
